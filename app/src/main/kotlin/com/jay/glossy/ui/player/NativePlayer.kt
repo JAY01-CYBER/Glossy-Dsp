@@ -8,17 +8,22 @@ class NativePlayer : AutoCloseable {
     private var handle: Long = create()
     private val available = AtomicBoolean(handle != 0L)
 
+    init { AudioDiagnostics.log(if (available.get()) "INFO" else "ERROR", "NativePlayer", if (available.get()) "Native engine initialized" else "Native engine failed to initialize") }
+
     fun playUrl(url: String, positionMs: Long = 0L): Boolean {
-        if (!available.get()) return false
+        if (!available.get()) { AudioDiagnostics.log("ERROR", "NativePlayer", "play requested but native handle is unavailable"); return false }
+        AudioDiagnostics.log("INFO", "NativePlayer", "play requested (source details omitted for privacy)")
         val requested = runCatching { nPlayUrl(handle, url, positionMs) }.getOrDefault(false)
-        if (!requested) return false
-        return runCatching { nWaitUntilReady(handle, 15_000) }.getOrDefault(false)
+        if (!requested) { AudioDiagnostics.log("ERROR", "NativePlayer", "native play request failed"); return false }
+        val ready = runCatching { nWaitUntilReady(handle, 15_000) }.getOrDefault(false)
+        AudioDiagnostics.log(if (ready) "INFO" else "WARN", "NativePlayer", if (ready) "native playback pipeline reported ready" else "timed out waiting for native playback readiness")
+        return ready
     }
 
-    fun pause() { if (available.get()) runCatching { nPause(handle) } }
-    fun resume() { if (available.get()) runCatching { nResume(handle) } }
-    fun stop() { if (available.get()) runCatching { nStop(handle) } }
-    fun seekTo(positionMs: Long): Boolean = available.get() && runCatching { nSeekTo(handle, positionMs) }.getOrDefault(false)
+    fun pause() { if (available.get()) { runCatching { nPause(handle) }; AudioDiagnostics.log(message = "pause requested") } }
+    fun resume() { if (available.get()) { runCatching { nResume(handle) }; AudioDiagnostics.log(message = "resume requested") } }
+    fun stop() { if (available.get()) { runCatching { nStop(handle) }; AudioDiagnostics.log(message = "stop requested") } }
+    fun seekTo(positionMs: Long): Boolean { val ok = available.get() && runCatching { nSeekTo(handle, positionMs) }.getOrDefault(false); AudioDiagnostics.log(if (ok) "INFO" else "WARN", "NativePlayer", "seek requested; accepted=$ok"); return ok }
     fun position(): Long = if (available.get()) runCatching { nPosition(handle) }.getOrDefault(0L) else 0L
     fun duration(): Long = if (available.get()) runCatching { nDuration(handle) }.getOrDefault(0L) else 0L
     fun hasError(): Boolean = available.get() && runCatching { nHasError(handle) }.getOrDefault(false)
@@ -27,6 +32,7 @@ class NativePlayer : AutoCloseable {
 
     fun syncDsp() {
         if (!available.get()) return
+        AudioDiagnostics.log(message = "DSP settings sync requested")
         val (_, settings) = NativeDspController.snapshot()
         runCatching {
             nSetDsp(
@@ -53,7 +59,7 @@ class NativePlayer : AutoCloseable {
         }
     }
 
-    private fun create(): Long = runCatching { nCreate() }.getOrDefault(0L)
+    private fun create(): Long = runCatching { nCreate() }.getOrDefault(0L).also { AudioDiagnostics.log(if (it != 0L) "INFO" else "ERROR", "NativePlayer", if (it != 0L) "native handle created" else "native handle creation failed") }
 
     private external fun nCreate(): Long
     private external fun nPlayUrl(handle: Long, url: String, positionMs: Long): Boolean
