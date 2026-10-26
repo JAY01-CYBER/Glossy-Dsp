@@ -47,6 +47,42 @@ extern "C" {
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
+
+// Forward selected native-engine events into the in-app AudioDiagnostics buffer.
+// This runs only on control/decoder threads, never from Oboe's real-time callback.
+static JavaVM* gGlossyJavaVm = nullptr;
+static void glossyDiagnostic(const char* level, const char* tag, const std::string& message) {
+    JavaVM* vm = gGlossyJavaVm;
+    if (!vm) return;
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    jint state = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+    if (state == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attached = true;
+    } else if (state != JNI_OK || !env) return;
+
+    jclass cls = env->FindClass("com/jay/glossy/ui/player/AudioDiagnostics");
+    if (cls) {
+        jfieldID instanceField = env->GetStaticFieldID(cls, "INSTANCE", "Lcom/jay/glossy/ui/player/AudioDiagnostics;");
+        jobject instance = instanceField ? env->GetStaticObjectField(cls, instanceField) : nullptr;
+        jmethodID method = env->GetMethodID(cls, "log", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (instance && method) {
+            jstring jlevel = env->NewStringUTF(level ? level : "INFO");
+            jstring jtag = env->NewStringUTF(tag ? tag : "NativeAudio");
+            jstring jmessage = env->NewStringUTF(message.c_str());
+            if (jlevel && jtag && jmessage) env->CallVoidMethod(instance, method, jlevel, jtag, jmessage);
+            if (jlevel) env->DeleteLocalRef(jlevel);
+            if (jtag) env->DeleteLocalRef(jtag);
+            if (jmessage) env->DeleteLocalRef(jmessage);
+            env->DeleteLocalRef(instance);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) vm->DetachCurrentThread();
+}
+
 namespace {
 
 constexpr int kOutputRate = 48000;
@@ -173,6 +209,7 @@ public:
         stopRequested_.store(false, std::memory_order_release);
         paused_.store(false, std::memory_order_release);
         error_.store(false, std::memory_order_release);
+        dspEventLogged_.store(false, std::memory_order_release);
         initDone_.store(false, std::memory_order_release);
         worker_ = std::thread(&Player::decodeLoop, this);
         // Do not report success until native decoder + output path are actually initialized.
@@ -340,6 +377,7 @@ private:
         oboe::Result r = builder.openStream(stream_);
         if (r != oboe::Result::OK) {
             LOGE("Oboe open failed: %s", oboe::convertToText(r));
+            glossyDiagnostic("ERROR", "Oboe", std::string("output stream open failed: ") + oboe::convertToText(r));
             return false;
         }
         const int actualRate = stream_->getSampleRate();
@@ -347,6 +385,7 @@ private:
         const auto actualFormat = stream_->getFormat();
         LOGI("Oboe output negotiated: requested=%dHz actual=%dHz/%dch format=%s",
              kOutputRate, actualRate, actualChannels, oboe::convertToText(actualFormat));
+        glossyDiagnostic("INFO", "Oboe", std::string("output stream opened: ") + std::to_string(actualRate) + " Hz, " + std::to_string(actualChannels) + " channels, format=" + oboe::convertToText(actualFormat));
         if (actualRate <= 0 || (actualChannels != 1 && actualChannels != 2) ||
             (actualFormat != oboe::AudioFormat::Float && actualFormat != oboe::AudioFormat::I16)) {
             LOGE("Unsupported Oboe output format: rate=%d channels=%d format=%s", actualRate, actualChannels, oboe::convertToText(actualFormat));
@@ -699,12 +738,22 @@ private:
 
         int result = format ? avformat_open_input(&format, url.c_str(), nullptr, &options) : AVERROR(ENOMEM);
         av_dict_free(&options);
-        if (result >= 0) result = avformat_find_stream_info(format, nullptr);
+        if (result >= 0) {
+            glossyDiagnostic("INFO", "FFmpeg", "input opened successfully");
+            result = avformat_find_stream_info(format, nullptr);
+        } else {
+            glossyDiagnostic("ERROR", "FFmpeg", std::string("input open failed: ") + av_err2str(result));
+        }
         if (result >= 0) audioIndex = av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
         if (audioIndex >= 0) {
             AVStream* audioStream = format->streams[audioIndex];
             const AVCodec* codec = avcodec_find_decoder(audioStream->codecpar->codec_id);
-            if (codec) decoder = avcodec_alloc_context3(codec);
+            if (codec) {
+                glossyDiagnostic("INFO", "FFmpeg", std::string("audio decoder selected: ") + codec->name);
+                decoder = avcodec_alloc_context3(codec);
+            } else {
+                glossyDiagnostic("ERROR", "FFmpeg", "no decoder found for selected audio stream");
+            }
             if (decoder && avcodec_parameters_to_context(decoder, audioStream->codecpar) >= 0 &&
                 avcodec_open2(decoder, codec, nullptr) >= 0) {
                 packet = av_packet_alloc();
@@ -718,6 +767,7 @@ private:
             }
         }
         if (!initialized) {
+            glossyDiagnostic("ERROR", "FFmpeg", std::string("decoder/output initialization failed: ") + (result < 0 ? av_err2str(result) : "no supported audio stream"));
             LOGE("FFmpeg decoder/output initialization failed: %s", result < 0 ? av_err2str(result) : "no supported audio stream");
             error_.store(true, std::memory_order_release);
             playing_.store(false, std::memory_order_release);
@@ -741,10 +791,13 @@ private:
         }
         hasMedia_.store(true, std::memory_order_release);
         playing_.store(true, std::memory_order_release);
+        glossyDiagnostic("INFO", "FFmpeg", "decoder and output pipeline ready; decoding loop started");
         initDone_.store(true, std::memory_order_release);
         initCv_.notify_all();
 
         bool eof = false;
+        bool firstFrameLogged = false;
+        uint64_t decodedFrameCount = 0;
         while (!stopRequested_.load(std::memory_order_acquire)) {
             if (paused_.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -786,12 +839,18 @@ private:
                     LOGE("FFmpeg frame decode failed: %s", av_err2str(result));
                     break;
                 }
+                ++decodedFrameCount;
+                if (!firstFrameLogged) {
+                    firstFrameLogged = true;
+                    glossyDiagnostic("INFO", "FFmpeg", std::string("first audio frame decoded: rate=") + std::to_string(frame->sample_rate) + " Hz, channels=" + std::to_string(frame->ch_layout.nb_channels) + ", samples=" + std::to_string(frame->nb_samples));
+                }
                 int64_t ptsUs = -1;
                 if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
                     ptsUs = av_rescale_q(frame->best_effort_timestamp,
                         format->streams[audioIndex]->time_base, AVRational{1,1000000});
                 }
                 if (!processFfmpegFrame(frame, swr, configuredLayout, configuredFormat, configuredRate, ptsUs)) {
+                    glossyDiagnostic("ERROR", "DSP", "failed to convert/process decoded audio frame");
                     error_.store(true, std::memory_order_release);
                     stopRequested_.store(true, std::memory_order_release);
                 }
@@ -804,6 +863,9 @@ private:
             }
         }
 
+        if (decodedFrameCount > 0) {
+            glossyDiagnostic("INFO", "FFmpeg", std::string("decoder loop finished; decoded frames=") + std::to_string(decodedFrameCount));
+        }
         if (swr) swr_free(&swr);
         av_channel_layout_uninit(&configuredLayout);
         if (packet) av_packet_free(&packet);
@@ -862,11 +924,17 @@ private:
     std::atomic<int64_t> playbackBaseMs_{0};
     std::atomic<uint64_t> renderedFrames_{0};
     std::atomic<bool> positionPrimed_{false};
+    std::atomic<bool> dspEventLogged_{false};
     std::atomic<int64_t> durationMs_{0};
     std::atomic<float> volume_{1.0f};
 };
 
 } // namespace
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    gGlossyJavaVm = vm;
+    return JNI_VERSION_1_6;
+}
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_jay_glossy_ui_player_NativePlayer_nCreate(JNIEnv*, jobject) { return reinterpret_cast<jlong>(new Player()); }
