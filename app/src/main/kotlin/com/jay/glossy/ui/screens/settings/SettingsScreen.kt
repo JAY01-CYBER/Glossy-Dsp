@@ -142,6 +142,12 @@ fun SettingsScreen(
                             onClick = { navController.navigate("settings/player") }
                         ),
                         Material3SettingsItem(
+                            icon = painterResource(R.drawable.info),
+                            title = { Text("Audio Logs & Diagnostics") },
+                            description = { Text("View and share Glossy native audio events") },
+                            onClick = { navController.navigate("settings/audio_logs") }
+                        ),
+                        Material3SettingsItem(
                             icon = painterResource(R.drawable.radio),
                             title = { Text(stringResource(R.string.stream_sources)) },
                             onClick = { navController.navigate("settings/stream_sources") }
