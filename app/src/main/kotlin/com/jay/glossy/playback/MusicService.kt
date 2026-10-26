@@ -387,6 +387,7 @@ class MusicService :
     @Volatile private var audioEngineMode = AudioEngineMode.EXOPLAYER
     private val nativeStartMutex = Mutex()
     private val nativeStartGeneration = AtomicLong(0L)
+    @Volatile private var nativeActiveMediaId: String? = null
 
     inner class MusicBinder : Binder() {
         val service: MusicService
@@ -444,8 +445,13 @@ class MusicService :
     private fun applyEffectiveVolume() {
         if (!::player.isInitialized || isCrossfading) return
         val vol = calculateEffectiveVolume()
-        player.volume = vol
-        nativeAudioProcessor.setRoutingEnabled(audioEngineMode == AudioEngineMode.GLOSSY_NATIVE)
+        if (audioEngineMode == AudioEngineMode.GLOSSY_NATIVE) {
+            player.volume = 0f
+            glossyNativePlayer.setVolume(vol)
+        } else {
+            player.volume = vol
+        }
+        nativeAudioProcessor.setRoutingEnabled(false)
     }
 
     fun isGlossyNativeEngine(): Boolean = audioEngineMode == AudioEngineMode.GLOSSY_NATIVE
@@ -453,21 +459,64 @@ class MusicService :
     suspend fun switchAudioEngine(mode: AudioEngineMode) {
         if (!::player.isInitialized || mode == audioEngineMode) return
         audioEngineMode = mode
-        nativeAudioProcessor.setRoutingEnabled(mode == AudioEngineMode.GLOSSY_NATIVE)
-        // ExoPlayer remains the sole decoder, buffering owner and AudioSink owner in both
-        // modes. Glossy Native mode means the decoded PCM is processed by the C++ DSP
-        // AudioProcessor; it does not create a second competing decoder/output clock.
-        player.volume = calculateEffectiveVolume()
+        nativeAudioProcessor.setRoutingEnabled(false)
         if (mode == AudioEngineMode.GLOSSY_NATIVE) {
+            // NativePlayer owns FFmpeg decoding and Oboe output in Glossy mode. Keep the
+            // existing ExoPlayer instance for queue/session compatibility, but silence it.
+            player.volume = 0f
+            glossyNativePlayer.setVolume(calculateEffectiveVolume())
+            glossyNativePlayer.syncDsp()
+            nativeActiveMediaId = null
+            if (player.playWhenReady) startGlossyNativeForCurrentItem()
+        } else {
             glossyNativePlayer.stop()
+            nativeActiveMediaId = null
+            player.volume = calculateEffectiveVolume()
         }
-        applyEffectiveVolume()
     }
 
     suspend fun startGlossyNativeForCurrentItem() {
-        // Kept for source compatibility with existing callers. Playback is already owned by
-        // ExoPlayer; the native Glossy engine is inserted into its AudioProcessorChain.
-        nativeAudioProcessor.setRoutingEnabled(audioEngineMode == AudioEngineMode.GLOSSY_NATIVE)
+        if (!::player.isInitialized || audioEngineMode != AudioEngineMode.GLOSSY_NATIVE) return
+        nativeStartMutex.withLock {
+            val item = player.currentMediaItem ?: run {
+                glossyNativePlayer.stop()
+                nativeActiveMediaId = null
+                return
+            }
+            val uri = item.localConfiguration?.uri
+            if (uri == null) {
+                player.volume = calculateEffectiveVolume()
+                com.jay.glossy.ui.player.AudioDiagnostics.log("ERROR", "FFmpeg", "current media item has no resolvable URI; restored ExoPlayer audio fallback")
+                return
+            }
+            val source = uri.toString()
+            if (uri.scheme !in setOf("http", "https", "file")) {
+                player.volume = calculateEffectiveVolume()
+                com.jay.glossy.ui.player.AudioDiagnostics.log("ERROR", "FFmpeg", "unsupported source scheme for native FFmpeg: ${uri.scheme ?: "none"}; restored ExoPlayer audio fallback")
+                return
+            }
+            val mediaId = item.mediaId.ifBlank { source }
+            if (nativeActiveMediaId == mediaId && glossyNativePlayer.isPlaying()) {
+                glossyNativePlayer.resume()
+                return
+            }
+            nativeStartGeneration.incrementAndGet()
+            glossyNativePlayer.stop()
+            player.volume = 0f
+            glossyNativePlayer.setVolume(calculateEffectiveVolume())
+            glossyNativePlayer.syncDsp()
+            com.jay.glossy.ui.player.AudioDiagnostics.log("INFO", "FFmpeg", "starting native FFmpeg decode for current media item")
+            val startPositionMs = player.currentPosition.coerceAtLeast(0L)
+            val started = withContext(Dispatchers.IO) { glossyNativePlayer.playUrl(source, startPositionMs) }
+            if (started) {
+                nativeActiveMediaId = mediaId
+                player.volume = 0f
+            } else {
+                nativeActiveMediaId = null
+                player.volume = calculateEffectiveVolume()
+                com.jay.glossy.ui.player.AudioDiagnostics.log("ERROR", "FFmpeg", "native FFmpeg playback failed; restored ExoPlayer audio fallback")
+            }
+        }
     }
 
 
@@ -810,10 +859,14 @@ class MusicService :
                 .let { runCatching { AudioEngineMode.valueOf(it) }.getOrDefault(AudioEngineMode.EXOPLAYER) }
         }
         player = createExoPlayer(prefs = startupPrefs!!)
-        // Glossy Native is a native DSP route inside ExoPlayer's AudioSink. Keep ExoPlayer
-        // audible in both modes; only the PCM processing route changes.
-        nativeAudioProcessor.setRoutingEnabled(audioEngineMode == AudioEngineMode.GLOSSY_NATIVE)
-        player.volume = 1f
+        // Glossy Native mode uses the standalone FFmpeg + Oboe pipeline. ExoPlayer remains
+        // available for queue/session metadata, but its audio is muted in that mode.
+        nativeAudioProcessor.setRoutingEnabled(false)
+        player.volume = if (audioEngineMode == AudioEngineMode.GLOSSY_NATIVE) 0f else 1f
+        if (audioEngineMode == AudioEngineMode.GLOSSY_NATIVE) {
+            glossyNativePlayer.setVolume(calculateEffectiveVolume())
+            glossyNativePlayer.syncDsp()
+        }
 
         scope.launch {
             dataStore.data.map { it[AudioEngineModeKey] ?: AudioEngineMode.EXOPLAYER.name }
@@ -2760,6 +2813,9 @@ class MusicService :
             }
         }
         lastTransitionedMediaId = mediaItem?.mediaId
+        if (audioEngineMode == AudioEngineMode.GLOSSY_NATIVE && player.playWhenReady) {
+            scope.launch { startGlossyNativeForCurrentItem() }
+        }
         mediaItem?.mediaId?.let { id -> crossfadeFilterProcessors[player]?.analysisMediaId = id }
 
         previousEpisodeId?.let { episodeId ->
@@ -2926,6 +2982,14 @@ class MusicService :
             if (currentMetadata?.isEpisode == true && player.currentPosition > 0) {
                 saveEpisodePosition(currentMetadata.id, player.currentPosition)
                 previousEpisodePosition = player.currentPosition
+            }
+        }
+
+        if (audioEngineMode == AudioEngineMode.GLOSSY_NATIVE) {
+            if (playWhenReady) {
+                scope.launch { startGlossyNativeForCurrentItem() }
+            } else {
+                glossyNativePlayer.pause()
             }
         }
 
@@ -3922,8 +3986,8 @@ class MusicService :
     /**
      * Resolve non-YouTube audio before falling back to YouTube Music.
      *
-     * Glossy Native mode uses the same ExoPlayer source pipeline and only changes
-     * the PCM processor routing, so resolved provider URIs work in both modes.
+     * Glossy Native mode attempts FFmpeg decode from the current resolved media URI.
+     * Provider URLs must be directly accessible to FFmpeg for native playback.
      */
     private data class AlternativeAudioStream(
         val uri: String,
@@ -5160,6 +5224,9 @@ class MusicService :
         reason: Int,
     ) {
         if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+            if (audioEngineMode == AudioEngineMode.GLOSSY_NATIVE) {
+                glossyNativePlayer.seekTo(newPosition.positionMs.coerceAtLeast(0L))
+            }
             scheduleCrossfade()
         }
     }
