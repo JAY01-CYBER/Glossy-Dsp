@@ -4,6 +4,7 @@ import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import com.jay.glossy.ui.player.NativeEngine
+import com.jay.glossy.ui.player.AudioDiagnostics
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -20,9 +21,18 @@ class NativeAudioProcessor : AudioProcessor {
     private var encoding = C.ENCODING_INVALID
     private var active = false
     @Volatile private var routingEnabled = false
+    private var configureEventLogged = false
+    private var firstPcmEventLogged = false
+    private var firstDspEventLogged = false
+    private var dspFallbackEventLogged = false
 
     fun setRoutingEnabled(enabled: Boolean) {
+        val changed = routingEnabled != enabled
         routingEnabled = enabled
+        if (changed) AudioDiagnostics.log(
+            "INFO", "NativeDSP",
+            "routing ${if (enabled) "enabled" else "disabled"}; decoded PCM still comes from Media3/ExoPlayer"
+        )
     }
     private var inputEnded = false
     private var outputBuffer: ByteBuffer = EMPTY_BUFFER
@@ -48,10 +58,15 @@ class NativeAudioProcessor : AudioProcessor {
         // of crashing the app on a JNI symbol mismatch.
         if (!configured) {
             active = false
+            AudioDiagnostics.log("ERROR", "NativeDSP", "native DSP configure failed; PCM will pass through unchanged")
             return inputAudioFormat
         }
 
         active = true
+        if (!configureEventLogged) {
+            configureEventLogged = true
+            AudioDiagnostics.log("INFO", "NativeDSP", "processor configured: ${sampleRate} Hz, ${channelCount} channels, encoding=$encoding")
+        }
         return inputAudioFormat
     }
 
@@ -63,6 +78,11 @@ class NativeAudioProcessor : AudioProcessor {
 
         val out = replaceOutputBuffer(bytes)
         val input = inputBuffer.slice().order(ByteOrder.nativeOrder())
+
+        if (!firstPcmEventLogged) {
+            firstPcmEventLogged = true
+            AudioDiagnostics.log("INFO", "NativeDSP", "first decoded PCM buffer received: $bytes bytes; processorActive=$active; routingEnabled=$routingEnabled")
+        }
 
         if (!routingEnabled || !active) {
             out.put(input)
@@ -91,10 +111,18 @@ class NativeAudioProcessor : AudioProcessor {
         }
         inputBuffer.position(inputBuffer.limit())
         if (written > 0) {
+            if (!firstDspEventLogged) {
+                firstDspEventLogged = true
+                AudioDiagnostics.log("INFO", "NativeDSP", "first PCM buffer processed by native Glossy DSP: $written bytes")
+            }
             out.position(0)
             out.limit(written)
             outputBuffer = out
         } else {
+            if (!dspFallbackEventLogged) {
+                dspFallbackEventLogged = true
+                AudioDiagnostics.log("WARN", "NativeDSP", "native DSP returned no output; passing original PCM through")
+            }
             // Never turn a native DSP failure into silence. Preserve the decoded PCM.
             out.clear()
             out.put(input)
