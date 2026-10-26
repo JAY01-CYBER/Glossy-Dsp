@@ -55,6 +55,7 @@ import com.jay.glossy.ui.screens.settings.PlayerSettings
 import com.jay.glossy.ui.screens.settings.PrivacySettings
 import com.jay.glossy.ui.screens.settings.RomanizationSettings
 import com.jay.glossy.ui.screens.settings.SettingsScreen
+import com.jay.glossy.ui.screens.settings.AudioLogsScreen
 import com.jay.glossy.ui.screens.settings.StorageSettings
 import com.jay.glossy.ui.screens.settings.StreamSourcesSettings
 import com.jay.glossy.ui.screens.settings.ThemeScreen
@@ -385,6 +386,10 @@ fun NavGraphBuilder.navigationBuilder(
 
     composable("settings") {
         SettingsScreen(navController, latestVersionName)
+    }
+
+    composable("settings/audio_logs") {
+        AudioLogsScreen(navController)
     }
 
     composable("settings/appearance") {
