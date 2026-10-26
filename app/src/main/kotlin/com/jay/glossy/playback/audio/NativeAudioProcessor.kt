@@ -31,7 +31,7 @@ class NativeAudioProcessor : AudioProcessor {
         routingEnabled = enabled
         if (changed) AudioDiagnostics.log(
             "INFO", "NativeDSP",
-            "routing ${if (enabled) "enabled" else "disabled"}; decoded PCM still comes from Media3/ExoPlayer"
+            "Media3 PCM DSP routing ${if (enabled) "enabled" else "disabled"}"
         )
     }
     private var inputEnded = false
