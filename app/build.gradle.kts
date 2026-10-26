@@ -109,6 +109,11 @@ android {
     defaultConfig {
         applicationId = applicationIdOverride ?: baseApplicationId
         minSdk = 26
+        // FFmpeg binaries supplied with this project exist for these ABIs only.
+        // Exclude x86 because no x86 FFmpeg shared libraries were provided.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
         targetSdk = 36
         versionCode = 4
         versionName = "0.0.4"
