@@ -803,6 +803,9 @@ class MusicService :
         // never calls dataStore.get() (which does runBlocking internally).
         // This consolidates ~15 main-thread-blocking DataStore reads into 1.
         startupPrefs = runBlocking(Dispatchers.IO) { dataStore.data.first() }
+        // Initialize volume state before any startup path calls calculateEffectiveVolume().
+        // In particular, Glossy Native mode calculates its initial output volume below.
+        playerVolume = MutableStateFlow((startupPrefs!![PlayerVolumeKey] ?: 1f).coerceIn(0f, 1f))
 
         // 3. Connect the processor to the service
         // handled in createExoPlayer
@@ -951,7 +954,6 @@ class MusicService :
             if (value == "VERY_HIGH") com.jay.glossy.constants.AudioQuality.HIGH
             else com.jay.glossy.constants.AudioQuality.entries.find { it.name == value }
         } ?: com.jay.glossy.constants.AudioQuality.AUTO
-        playerVolume = MutableStateFlow((startupPrefs!![PlayerVolumeKey] ?: 1f).coerceIn(0f, 1f))
 
         initializeCast()
 
