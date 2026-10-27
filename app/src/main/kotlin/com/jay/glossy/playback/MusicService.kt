@@ -484,18 +484,72 @@ class MusicService :
                 return
             }
             val uri = item.localConfiguration?.uri
-            if (uri == null) {
+            val mediaId = item.mediaId.ifBlank { uri?.toString().orEmpty() }
+            if (mediaId.isBlank()) {
                 player.volume = calculateEffectiveVolume()
-                com.jay.glossy.ui.player.AudioDiagnostics.log("ERROR", "FFmpeg", "current media item has no resolvable URI; restored ExoPlayer audio fallback")
+                com.jay.glossy.ui.player.AudioDiagnostics.log(
+                    "ERROR", "FFmpeg",
+                    "current media item has no URI or media ID; restored ExoPlayer audio fallback"
+                )
                 return
             }
-            val source = uri.toString()
-            if (uri.scheme !in setOf("http", "https", "file")) {
+
+            // Glossy's MediaItem stores the YouTube song ID in its URI field. That is
+            // intentionally resolved by Media3's ResolvingDataSource, but FFmpeg needs
+            // a real stream URL. Resolve IDs here instead of passing the bare ID to FFmpeg.
+            val source = when (uri?.scheme?.lowercase()) {
+                "http", "https", "file" -> uri.toString()
+                null, "" -> withContext(Dispatchers.IO) {
+                    val song = runCatching { database.song(mediaId).first() }.getOrNull()
+                    if (song?.song?.isLocal == true || song?.song?.isDownloaded == true) {
+                        com.jay.glossy.ui.player.AudioDiagnostics.log(
+                            "WARN", "FFmpeg",
+                            "local/downloaded item cannot be opened from its song ID by FFmpeg; restored ExoPlayer audio fallback"
+                        )
+                        null
+                    } else {
+                        val alternative = try {
+                            resolveAlternativeAudio(mediaId)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            null
+                        }
+                        if (alternative != null) {
+                            currentStreamClient.value = alternative.provider
+                            songUrlCache[mediaId] = alternative.uri to alternative.expiresAtMs
+                            com.jay.glossy.ui.player.AudioDiagnostics.log(
+                                "INFO", "FFmpeg",
+                                "resolved media ID through alternate audio provider for native decoding"
+                            )
+                            alternative.uri
+                        } else {
+                            val resolvedUrl = getStreamUrl(mediaId)
+                            if (!resolvedUrl.isNullOrBlank()) {
+                                com.jay.glossy.ui.player.AudioDiagnostics.log(
+                                    "INFO", "FFmpeg",
+                                    "resolved media ID to a playable stream URL for native decoding"
+                                )
+                                resolvedUrl
+                            } else {
+                                null
+                            }
+                        }
+                    }
+                }
+                else -> null
+            }
+
+            if (source.isNullOrBlank()) {
                 player.volume = calculateEffectiveVolume()
-                com.jay.glossy.ui.player.AudioDiagnostics.log("ERROR", "FFmpeg", "unsupported source scheme for native FFmpeg: ${uri.scheme ?: "none"}; restored ExoPlayer audio fallback")
+                val scheme = uri?.scheme?.takeIf { it.isNotBlank() } ?: "none"
+                com.jay.glossy.ui.player.AudioDiagnostics.log(
+                    "ERROR", "FFmpeg",
+                    "could not resolve a native-compatible source (scheme=$scheme); restored ExoPlayer audio fallback"
+                )
                 return
             }
-            val mediaId = item.mediaId.ifBlank { source }
+
             if (nativeActiveMediaId == mediaId && glossyNativePlayer.isPlaying()) {
                 glossyNativePlayer.resume()
                 return
@@ -505,7 +559,9 @@ class MusicService :
             player.volume = 0f
             glossyNativePlayer.setVolume(calculateEffectiveVolume())
             glossyNativePlayer.syncDsp()
-            com.jay.glossy.ui.player.AudioDiagnostics.log("INFO", "FFmpeg", "starting native FFmpeg decode for current media item")
+            com.jay.glossy.ui.player.AudioDiagnostics.log(
+                "INFO", "FFmpeg", "starting native FFmpeg decode for resolved media source"
+            )
             val startPositionMs = player.currentPosition.coerceAtLeast(0L)
             val started = withContext(Dispatchers.IO) { glossyNativePlayer.playUrl(source, startPositionMs) }
             if (started) {
@@ -514,11 +570,12 @@ class MusicService :
             } else {
                 nativeActiveMediaId = null
                 player.volume = calculateEffectiveVolume()
-                com.jay.glossy.ui.player.AudioDiagnostics.log("ERROR", "FFmpeg", "native FFmpeg playback failed; restored ExoPlayer audio fallback")
+                com.jay.glossy.ui.player.AudioDiagnostics.log(
+                    "ERROR", "FFmpeg", "native FFmpeg playback failed; restored ExoPlayer audio fallback"
+                )
             }
         }
     }
-
 
     // ========== GLOSSY AUDIO ROUTING LOGIC ==========
     var preferredDeviceId: Int? = null
